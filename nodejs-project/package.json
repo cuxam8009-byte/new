@@ -1,0 +1,10 @@
+{
+  "name": "mcbot-manager-node",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Backend Node.js của MC Bot Manager (chạy trong app Android bằng nodejs-mobile)",
+  "main": "main.js",
+  "dependencies": {
+    "bedrock-protocol": "latest"
+  }
+}

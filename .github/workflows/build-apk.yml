@@ -1,0 +1,226 @@
+# QUAN TRỌNG: file này phải nằm ở thư mục GỐC của repo, đúng đường dẫn:  .github/workflows/build-apk.yml
+# (GitHub KHÔNG đọc workflow nằm bên trong project.zip. Bản trong zip chỉ để cất giữ.)
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'Tên phiên bản của app (vd 1.1.0)'
+        default: '1.1.0'
+      abis:
+        description: 'Kiến trúc CPU, cách nhau bằng dấu phẩy (arm64-v8a là đủ cho máy đời mới)'
+        default: 'arm64-v8a,armeabi-v7a'
+  push:
+    paths:
+      - 'project.zip'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: write
+
+# Có lần chạy mới thì hủy lần cũ đang chạy dở (đỡ tốn thời gian, đỡ nhầm kết quả)
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      APP_VERSION: ${{ inputs.app_version || '1.1.0' }}
+      ABIS: ${{ inputs.abis || 'arm64-v8a,armeabi-v7a' }}
+      NODE_MOBILE_TAG: v18.20.4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kiểm tra repo (và cảnh báo nếu còn workflow cũ)
+        run: |
+          {
+            echo "## Kiểm tra repo"
+            echo
+            echo "Các file trong thư mục gốc:"
+            echo '```'
+            ls -la
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          others=$(ls .github/workflows 2>/dev/null | grep -v '^build-apk.yml$' || true)
+          if [ -n "$others" ]; then
+            echo "::warning::Repo còn workflow khác: $others. Nếu đó là workflow của dự án cũ, nó cũng chạy khi bạn tải project.zip lên và sẽ báo lỗi đỏ. Hãy xóa file đó (Add file > xóa trong .github/workflows)."
+            {
+              echo "### ⚠️ Còn workflow khác trong repo"
+              echo "Các file: $others"
+              echo "Nếu đó là workflow của dự án cũ thì nó cũng chạy cùng lúc và sẽ báo lỗi. Hãy xóa nó."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ ! -f project.zip ] && [ ! -f app/build.gradle ]; then
+            echo "::error::Không thấy project.zip (hoặc thư mục app/) ở thư mục gốc repo. Hãy tải project.zip lên đúng thư mục gốc, đừng giải nén."
+            exit 1
+          fi
+
+      - name: Chuẩn bị thư mục project (_proj)
+        run: |
+          set -e
+          mkdir -p _proj
+          if [ -f project.zip ]; then
+            unzip -q -o project.zip -d _proj
+          else
+            rsync -a --exclude='_proj' --exclude='.git' ./ _proj/
+          fi
+          test -f _proj/app/build.gradle || { echo "::error::Không thấy app/build.gradle trong project.zip - zip có thể đã bị bọc thêm một thư mục bên ngoài"; ls -la _proj; exit 1; }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cài thư viện Node (bedrock-protocol) và dọn cho nhẹ
+        working-directory: _proj/nodejs-project
+        run: |
+          set -e
+          MCV=$(grep -o "version: '[0-9][0-9.]*'" main.js | head -1 | grep -o "[0-9][0-9.]*" || true)
+          echo "Phiên bản Minecraft dùng để kiểm tra: ${MCV:-mặc định}"
+
+          # --ignore-scripts: không build thư viện native (raknet-native) - Android dùng bản JS thuần (jsp-raknet)
+          npm install --omit=dev --omit=optional --ignore-scripts --no-audit --no-fund
+          rm -rf node_modules/.bin
+
+          # Kiểm tra cú pháp mã của app trước khi đóng gói (lỗi cú pháp sẽ làm app không mở được)
+          node --check main.js
+
+          echo "== kiểm tra ban đầu =="
+          node ../tools/smoke.js "$MCV" || echo "CẢNH BÁO: smoke test lỗi ngay từ đầu (sẽ không dọn thêm)"
+
+          # Mỗi bước dọn đều chạy thử lại; nếu hỏng thì tự hoàn tác bước đó.
+          try_prune() {
+            desc="$1"; shift
+            rm -rf /tmp/nm_bak && cp -a node_modules /tmp/nm_bak
+            "$@" || true
+            if node ../tools/smoke.js "$MCV" > /tmp/smoke.log 2>&1; then
+              echo "OK   $desc"
+            else
+              echo "HOAN TAC $desc"; tail -5 /tmp/smoke.log
+              rm -rf node_modules && mv /tmp/nm_bak node_modules
+            fi
+          }
+          prune_junk()   { find node_modules \( -name '*.md' -o -name '*.markdown' -o -name '*.map' -o -name '*.d.ts' -o -name '*.tsbuildinfo' \) -type f -delete; find node_modules -type d \( -name test -o -name tests -o -name __tests__ -o -name docs -o -name examples -o -name .github \) -prune -exec rm -rf {} + ; }
+          prune_native() { rm -rf node_modules/raknet-native node_modules/raknet-node; }
+          prune_java()   { rm -rf node_modules/minecraft-data/minecraft-data/data/pc; }
+
+          if node ../tools/smoke.js "$MCV" > /dev/null 2>&1; then
+            try_prune "xóa file thừa (md/map/test)" prune_junk
+            try_prune "bỏ raknet-native (không dùng trên Android)" prune_native
+            try_prune "bỏ dữ liệu Minecraft Java Edition" prune_java
+          fi
+          du -sh node_modules
+
+      - name: Tải Node.js cho Android (nodejs-mobile)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          mkdir -p /tmp/nm && cd /tmp/nm
+          gh release download "$NODE_MOBILE_TAG" --repo nodejs-mobile/nodejs-mobile --pattern '*android*' \
+            || curl -fL -o nodejs-mobile-android.zip "https://github.com/nodejs-mobile/nodejs-mobile/releases/download/${NODE_MOBILE_TAG}/nodejs-mobile-${NODE_MOBILE_TAG}-android.zip"
+          ls -la
+          mkdir x && unzip -q ./*android*.zip -d x
+          cd "$GITHUB_WORKSPACE"
+          for abi in $(echo "$ABIS" | tr ',' ' '); do
+            so=$(find /tmp/nm/x -path "*/$abi/libnode.so" | head -1)
+            if [ -z "$so" ]; then echo "::error::Không thấy libnode.so cho $abi"; find /tmp/nm/x -name '*.so'; exit 1; fi
+            mkdir -p "_proj/app/libnode/bin/$abi"
+            cp "$so" "_proj/app/libnode/bin/$abi/libnode.so"
+            echo "libnode.so ($abi): $(du -h "$so" | cut -f1)"
+            echo "  thư viện libnode.so phụ thuộc ($abi):"
+            readelf -d "$so" | grep NEEDED || true
+          done
+
+      - name: Đóng gói phần Node vào app
+        run: |
+          set -e
+          mkdir -p _proj/app/src/main/assets
+          (cd _proj/nodejs-project && zip -qr9 ../app/src/main/assets/nodejs-project.zip . -x 'package-lock.json')
+          ls -lh _proj/app/src/main/assets/
+
+      - name: Khóa ký APK (tạo nếu thiếu)
+        working-directory: _proj
+        run: |
+          if [ ! -f app/debug.keystore ]; then
+            keytool -genkeypair -keystore app/debug.keystore -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=McBotManager,O=McBot,C=VN"
+          fi
+
+      - name: Chấp nhận license Android SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Build APK
+        working-directory: _proj
+        run: |
+          set -o pipefail
+          gradle --no-daemon --stacktrace assembleDebug -PappVersionName="$APP_VERSION" -PappVersionCode="${{ github.run_number }}" -PabiList="$ABIS" 2>&1 | tee "$GITHUB_WORKSPACE/gradle.log"
+
+      - name: Đặt tên file APK
+        run: |
+          set -e
+          mkdir -p out
+          cp _proj/app/build/outputs/apk/debug/*.apk "out/McBotManager-v${APP_VERSION}-b${{ github.run_number }}.apk"
+          ls -lh out
+          {
+            echo "## ✅ Build thành công"
+            echo
+            echo "File: McBotManager-v${APP_VERSION}-b${{ github.run_number }}.apk ($(du -h out/*.apk | cut -f1))"
+            echo "Tải ở mục **Releases** của repo (hoặc Artifacts ở cuối trang này)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: McBotManager-APK
+          path: out/*.apk
+
+      - name: Đăng APK lên Releases (tải thẳng trên điện thoại)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "apk-${{ github.run_number }}" out/*.apk \
+            --repo "${{ github.repository }}" \
+            --title "MC Bot Manager v${APP_VERSION} (build ${{ github.run_number }})" \
+            --notes "APK cài trực tiếp. Cài đè lên bản cũ được (cùng khóa ký) và giữ nguyên cấu hình bot." \
+          || echo "Không tạo được Release (có thể repo chặn quyền ghi) - tải APK ở mục Artifacts của lần chạy này."
+
+      # Khi build lỗi: gom đoạn lỗi quan trọng vào trang tóm tắt để copy gửi lại (đọc log dài trên điện thoại rất khó)
+      - name: Tóm tắt lỗi build
+        if: failure()
+        run: |
+          {
+            echo "## ❌ Build lỗi"
+            echo "Copy phần trong khung bên dưới và gửi lại để được sửa."
+            echo '```'
+            if [ -f gradle.log ]; then
+              if grep -q 'What went wrong' gradle.log; then
+                grep -m1 -A25 'What went wrong' gradle.log
+              fi
+              echo "--- các dòng lỗi biên dịch ---"
+              grep -E '^e: |error: |FAILED' gradle.log | head -25 || true
+              echo "--- 30 dòng cuối của log ---"
+              tail -30 gradle.log
+            else
+              echo "Lỗi xảy ra trước bước Build APK. Mở bước màu đỏ phía trên để xem chi tiết."
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Lưu log build khi lỗi
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-log
+          path: gradle.log
+          if-no-files-found: ignore
