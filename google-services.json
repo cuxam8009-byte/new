@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "173758350095",
+    "project_id": "nest-32d7d",
+    "storage_bucket": "nest-32d7d.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:173758350095:android:e01d902076fa219040747a",
+        "android_client_info": {
+          "package_name": "com.nest.chat"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDSlKQpC3MXDix38Gg3d8_MYNqMy32_55M"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
