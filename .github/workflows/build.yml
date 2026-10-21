@@ -1,47 +1,65 @@
 name: Build APK
 
 on:
-workflow_dispatch:
-push:
-branches: [main, master]
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
 
 jobs:
-build:
-runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-latest
 
-steps:
-  - name: Checkout source
-    uses: actions/checkout@v4
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
 
-  - name: Set up Java
-    uses: actions/setup-java@v4
-    with:
-      distribution: temurin
-      java-version: '17'
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
-  - name: Set up Gradle
-    uses: gradle/actions/setup-gradle@v4
-    with:
-      gradle-version: '8.9'
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
 
-  - name: Check project files
-    run: |
-      ls -la
-      test -f settings.gradle || test -f settings.gradle.kts
-      test -d app
+      - name: Debug repository files
+        run: |
+          pwd
+          ls -la
+          find . -maxdepth 3 -type f \( -name '*.zip' -o -name 'settings.gradle*' -o -name 'google-services.json' \)
 
-  - name: Configure Google Services
-    run: |
-      test -f google-services.json
-      mkdir -p app
-      cp google-services.json app/google-services.json
+      - name: Prepare source
+        run: |
+          set -eu
+          rm -rf src_build
+          mkdir src_build
 
-  - name: Build APK
-    run: gradle assembleRelease --no-daemon --stacktrace
+          if [ -f project.zip ]; then
+            unzip -q project.zip -d src_build
+          elif [ -f settings.gradle ] || [ -f settings.gradle.kts ]; then
+            cp -a . src_build/
+          else
+            echo "ERROR: Cannot find project.zip or Gradle project in repository root."
+            exit 1
+          fi
 
-  - name: Upload APK
-    uses: actions/upload-artifact@v4
-    with:
-      name: Nest-APK
-      path: app/build/outputs/apk/release/*.apk
-      if-no-files-found: error
+          test -f google-services.json
+          mkdir -p src_build/app
+          cp google-services.json src_build/app/google-services.json
+
+          test -f src_build/settings.gradle || test -f src_build/settings.gradle.kts
+
+      - name: Build APK
+        working-directory: src_build
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nest-APK
+          path: src_build/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
