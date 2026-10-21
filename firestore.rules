@@ -1,0 +1,408 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function me() {
+      return request.auth.uid;
+    }
+
+    function userData(id) {
+      return get(/databases/$(database)/documents/users/$(id)).data;
+    }
+
+    function isSiteAdmin() {
+      return signedIn() && userData(me()).get('admin', false) == true;
+    }
+
+    function notBanned() {
+      return userData(me()).bannedUntil < request.time.toMillis()
+        && userData(me()).suspended == false;
+    }
+
+    function chatData(chatId) {
+      return get(/databases/$(database)/documents/chats/$(chatId)).data;
+    }
+
+    function isMember(chatId) {
+      return signedIn() && me() in chatData(chatId).members;
+    }
+
+    function isAdminOf(chatId) {
+      return signedIn() && me() in chatData(chatId).get('admins', [chatData(chatId).createdBy]);
+    }
+
+    function isFriend(other) {
+      return exists(/databases/$(database)/documents/users/$(me())/friends/$(other))
+        && exists(/databases/$(database)/documents/users/$(other)/friends/$(me()));
+    }
+
+    function isBlockedBetween(other) {
+      return exists(/databases/$(database)/documents/users/$(other)/blocked/$(me()))
+        || exists(/databases/$(database)/documents/users/$(me())/blocked/$(other));
+    }
+
+    function otherMember(m) {
+      return m[0] == me() ? m[1] : m[0];
+    }
+
+    function profileEdit() {
+      let d = request.resource.data;
+      return !d.diff(resource.data).affectedKeys().hasAny(['handle', 'strikes', 'bannedUntil', 'suspended', 'lastViolation', 'createdAt', 'admin'])
+        && d.name is string && d.name.size() > 0 && d.name.size() <= 30
+        && d.bio is string && d.bio.size() <= 120
+        && d.avatar is string && d.avatar.size() <= 100000
+        && d.get('status', '').size() <= 60
+        && d.get('birthday', '').size() <= 5
+        && d.discoverable is bool
+        && d.readReceipts is bool
+        && d.get('hideOnline', false) is bool
+        && d.get('allowRequests', true) is bool
+        && d.profileDone is bool
+        && d.get('lastSeen', request.time) is timestamp;
+    }
+
+    function selfViolation() {
+      let d = request.resource.data;
+      return d.diff(resource.data).affectedKeys().hasOnly(['strikes', 'bannedUntil', 'suspended', 'lastViolation'])
+        && d.strikes == resource.data.strikes + 1
+        && d.bannedUntil >= resource.data.bannedUntil
+        && d.bannedUntil <= request.time.toMillis() + 2678400000
+        && (d.suspended == true || resource.data.suspended == false);
+    }
+
+    function otherViolation(target) {
+      let d = request.resource.data;
+      let vid = target + '_' + string(d.strikes);
+      let vpath = /databases/$(database)/documents/violations/$(vid);
+      let v = getAfter(vpath).data;
+      let mpath = /databases/$(database)/documents/chats/$(v.chat)/messages/$(v.msg);
+      return d.diff(resource.data).affectedKeys().hasOnly(['strikes', 'bannedUntil', 'suspended', 'lastViolation'])
+        && d.strikes == resource.data.strikes + 1
+        && d.bannedUntil >= resource.data.bannedUntil
+        && d.bannedUntil <= request.time.toMillis() + 2678400000
+        && (d.suspended == resource.data.suspended || (d.suspended == true && d.strikes >= 5))
+        && v.by == me()
+        && v.target == target
+        && !exists(vpath)
+        && get(mpath).data.sender == target
+        && get(mpath).data.flagged == false
+        && getAfter(mpath).data.flagged == true;
+    }
+
+    function siteAdminUserUpdate() {
+      return isSiteAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['suspended', 'strikes', 'bannedUntil']);
+    }
+
+    function validDm(chatId) {
+      let m = request.resource.data.members;
+      return request.resource.data.type == 'dm'
+        && m.size() == 2
+        && m[0] != m[1]
+        && chatId == m[0] + '_' + m[1]
+        && isFriend(otherMember(m));
+    }
+
+    function validGroup() {
+      let d = request.resource.data;
+      return d.type == 'group'
+        && d.members.size() >= 2
+        && d.members.size() <= 50
+        && d.name is string
+        && d.name.size() > 0
+        && d.name.size() <= 40
+        && d.admins == [me()]
+        && d.get('description', '').size() <= 200
+        && d.get('avatar', '').size() <= 70000;
+    }
+
+    function lastMessageUpdate() {
+      let d = request.resource.data;
+      return d.diff(resource.data).affectedKeys().hasOnly(['lastText', 'lastKind', 'lastSender', 'lastTime', 'unread'])
+        && d.lastSender == me()
+        && d.lastTime == request.time
+        && d.lastText.size() <= 120
+        && notBanned();
+    }
+
+    function readerUpdate() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['unread']);
+    }
+
+    function pinUpdate() {
+      let d = request.resource.data;
+      let r = resource.data;
+      return d.diff(r).affectedKeys().hasOnly(['pinnedId', 'pinnedText', 'pinnedBy'])
+        && (r.type == 'dm' || me() in r.get('admins', [r.createdBy]))
+        && d.get('pinnedText', '').size() <= 120;
+    }
+
+    function adminUpdate() {
+      let d = request.resource.data;
+      let r = resource.data;
+      let admins = r.get('admins', [r.createdBy]);
+      let removed = r.members.toSet().difference(d.members.toSet());
+      let added = d.members.toSet().difference(r.members.toSet());
+      return r.type == 'group'
+        && me() in admins
+        && d.diff(r).affectedKeys().hasOnly(['name', 'description', 'avatar', 'onlyAdminsPost', 'inviteCode', 'members'])
+        && d.name.size() > 0
+        && d.name.size() <= 40
+        && d.get('description', '').size() <= 200
+        && d.get('avatar', '').size() <= 70000
+        && d.members.size() <= 50
+        && r.createdBy in d.members
+        && me() in d.members
+        && (removed.size() == 0 || added.size() == 0)
+        && (me() == r.createdBy || !removed.hasAny(admins));
+    }
+
+    function ownerUpdate() {
+      let d = request.resource.data;
+      let r = resource.data;
+      return r.type == 'group'
+        && r.createdBy == me()
+        && d.diff(r).affectedKeys().hasOnly(['createdBy', 'admins', 'disbanded'])
+        && d.createdBy in d.members
+        && d.createdBy in d.get('admins', [d.createdBy])
+        && d.get('admins', []).size() <= 10;
+    }
+
+    function leaveGroup() {
+      let d = request.resource.data;
+      let r = resource.data;
+      return r.type == 'group'
+        && d.diff(r).affectedKeys().hasOnly(['members'])
+        && !(me() in d.members)
+        && d.members.size() == r.members.size() - 1;
+    }
+
+    function joinByInvite(chatId) {
+      let d = request.resource.data;
+      let r = resource.data;
+      let j = getAfter(/databases/$(database)/documents/joins/$(chatId + '_' + me())).data;
+      return r.type == 'group'
+        && !(me() in r.members)
+        && r.get('disbanded', false) == false
+        && d.diff(r).affectedKeys().hasOnly(['members'])
+        && me() in d.members
+        && d.members.size() == r.members.size() + 1
+        && d.members.size() <= 50
+        && r.get('inviteCode', '') != ''
+        && j.code == r.inviteCode
+        && j.uid == me();
+    }
+
+    function flagUpdate() {
+      return me() != resource.data.sender
+        && resource.data.flagged == false
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['flagged'])
+        && request.resource.data.flagged == true;
+    }
+
+    function editUpdate() {
+      let d = request.resource.data;
+      return resource.data.sender == me()
+        && resource.data.kind == 'text'
+        && resource.data.get('recalled', false) == false
+        && d.diff(resource.data).affectedKeys().hasOnly(['text', 'edited'])
+        && d.edited == true
+        && d.text.size() > 0
+        && d.text.size() <= 4000
+        && notBanned();
+    }
+
+    function recallUpdate() {
+      let d = request.resource.data;
+      return resource.data.sender == me()
+        && d.diff(resource.data).affectedKeys().hasOnly(['text', 'image', 'recalled'])
+        && d.recalled == true
+        && d.text == ''
+        && d.image == '';
+    }
+
+    function reactionUpdate() {
+      let d = request.resource.data;
+      return d.diff(resource.data).affectedKeys().hasOnly(['reactions'])
+        && d.reactions.diff(resource.data.get('reactions', {})).affectedKeys().hasOnly([me()])
+        && d.reactions.get(me(), 'x').size() <= 8;
+    }
+
+    match /users/{uid} {
+      allow get: if signedIn();
+      allow list: if signedIn()
+        && resource.data.discoverable == true
+        && request.query.limit <= 10;
+
+      allow create: if signedIn() && me() == uid
+        && request.auth.token.email == request.resource.data.handle + '@nestchat.app'
+        && request.resource.data.handle.matches('^[a-z0-9_]{4,20}$')
+        && request.resource.data.keys().hasOnly(['handle', 'name', 'bio', 'avatar', 'status', 'birthday', 'discoverable', 'readReceipts', 'hideOnline', 'allowRequests', 'profileDone', 'strikes', 'bannedUntil', 'suspended', 'createdAt'])
+        && request.resource.data.strikes == 0
+        && request.resource.data.bannedUntil == 0
+        && request.resource.data.suspended == false;
+
+      allow update: if signedIn() && (
+        (me() == uid && (profileEdit() || selfViolation()))
+        || (me() != uid && (siteAdminUserUpdate() || otherViolation(uid)))
+      );
+
+      allow delete: if signedIn() && me() == uid;
+    }
+
+    match /users/{a}/friends/{b} {
+      allow read: if signedIn() && me() == a;
+      allow create: if signedIn() && (
+        (me() == a && exists(/databases/$(database)/documents/requests/$(b + '_' + a)))
+        || (me() == b && exists(/databases/$(database)/documents/requests/$(a + '_' + b)))
+      );
+      allow update: if signedIn() && me() == a
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['nickname'])
+        && request.resource.data.nickname.size() <= 30;
+      allow delete: if signedIn() && (me() == a || me() == b);
+    }
+
+    match /users/{a}/blocked/{b} {
+      allow read, write: if signedIn() && me() == a;
+    }
+
+    match /users/{a}/chatPrefs/{c} {
+      allow read, write: if signedIn() && me() == a;
+    }
+
+    match /users/{a}/tokens/{t} {
+      allow read, write: if signedIn() && me() == a;
+    }
+
+    match /requests/{reqId} {
+      allow read: if signedIn() && (resource.data.from == me() || resource.data.to == me());
+      allow create: if signedIn()
+        && request.resource.data.from == me()
+        && request.resource.data.to is string
+        && request.resource.data.to != me()
+        && reqId == request.resource.data.from + '_' + request.resource.data.to
+        && request.resource.data.keys().hasOnly(['from', 'to', 'createdAt'])
+        && userData(request.resource.data.to).get('allowRequests', true) == true
+        && !isBlockedBetween(request.resource.data.to);
+      allow delete: if signedIn() && (resource.data.from == me() || resource.data.to == me());
+    }
+
+    match /chats/{chatId} {
+      allow get: if signedIn() && (resource == null || me() in resource.data.members);
+      allow list: if signedIn() && me() in resource.data.members;
+
+      allow create: if signedIn() && notBanned()
+        && me() in request.resource.data.members
+        && request.resource.data.createdBy == me()
+        && request.resource.data.lastTime == request.time
+        && request.resource.data.keys().hasOnly(['type', 'members', 'name', 'description', 'avatar', 'admins', 'onlyAdminsPost', 'inviteCode', 'disbanded', 'unread', 'createdBy', 'lastText', 'lastKind', 'lastSender', 'lastTime', 'createdAt'])
+        && (validDm(chatId) || validGroup());
+
+      allow update: if signedIn() && (
+        (me() in resource.data.members && (
+          lastMessageUpdate() || readerUpdate() || pinUpdate() || adminUpdate() || ownerUpdate() || leaveGroup()
+        ))
+        || joinByInvite(chatId)
+      );
+
+      allow delete: if false;
+    }
+
+    match /chats/{chatId}/messages/{msgId} {
+      allow read: if isMember(chatId);
+
+      allow create: if isMember(chatId) && notBanned()
+        && chatData(chatId).get('disbanded', false) == false
+        && (chatData(chatId).get('onlyAdminsPost', false) == false || isAdminOf(chatId))
+        && !(chatData(chatId).type == 'dm' && isBlockedBetween(otherMember(chatData(chatId).members)))
+        && request.resource.data.keys().hasOnly(['sender', 'text', 'image', 'kind', 'w', 'h', 'time', 'flagged', 'replyTo', 'replyText', 'replySender', 'fwd', 'mentions'])
+        && request.resource.data.sender == me()
+        && request.resource.data.time == request.time
+        && request.resource.data.flagged == false
+        && request.resource.data.text is string
+        && request.resource.data.text.size() <= 4000
+        && request.resource.data.image is string
+        && request.resource.data.image.size() <= 700000
+        && request.resource.data.kind in ['text', 'image']
+        && request.resource.data.get('replyText', '').size() <= 200
+        && request.resource.data.get('mentions', []).size() <= 20;
+
+      allow update: if isMember(chatId)
+        && (flagUpdate() || editUpdate() || recallUpdate() || reactionUpdate());
+
+      allow delete: if signedIn() && resource.data.sender == me();
+    }
+
+    match /chats/{chatId}/reads/{rid} {
+      allow read: if isMember(chatId);
+      allow write: if isMember(chatId) && rid == me();
+    }
+
+    match /chats/{chatId}/typing/{tid} {
+      allow read: if isMember(chatId);
+      allow write: if isMember(chatId) && tid == me();
+    }
+
+    match /invites/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['chat', 'by', 'createdAt'])
+        && request.resource.data.by == me()
+        && isAdminOf(request.resource.data.chat);
+      allow update: if false;
+      allow delete: if signedIn() && isAdminOf(resource.data.chat);
+    }
+
+    match /joins/{jid} {
+      allow create, update: if signedIn()
+        && request.resource.data.keys().hasOnly(['code', 'chat', 'uid'])
+        && request.resource.data.uid == me()
+        && jid == request.resource.data.chat + '_' + me();
+      allow read, delete: if false;
+    }
+
+    match /reports/{rid} {
+      allow create: if signedIn()
+        && request.resource.data.reporter == me()
+        && request.resource.data.keys().hasOnly(['reporter', 'target', 'chat', 'msg', 'reason', 'status', 'createdAt']);
+      allow read, update, delete: if isSiteAdmin();
+    }
+
+    match /violations/{vid} {
+      allow create: if signedIn()
+        && request.resource.data.by == me()
+        && request.resource.data.keys().hasOnly(['by', 'target', 'chat', 'msg', 'kind', 'time'])
+        && isMember(request.resource.data.chat);
+      allow read, update, delete: if false;
+    }
+
+    match /appeals/{uid} {
+      allow read: if signedIn() && (me() == uid || isSiteAdmin());
+      allow create, update: if signedIn() && me() == uid
+        && request.resource.data.keys().hasOnly(['message', 'status', 'createdAt'])
+        && request.resource.data.status == 'pending';
+      allow update: if isSiteAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']);
+      allow delete: if isSiteAdmin();
+    }
+
+    match /config/{docId} {
+      allow read: if signedIn();
+      allow write: if isSiteAdmin();
+    }
+
+    match /feedback/{fid} {
+      allow create: if signedIn()
+        && request.resource.data.uid == me()
+        && request.resource.data.keys().hasOnly(['uid', 'text', 'version', 'createdAt'])
+        && request.resource.data.text.size() <= 1000;
+      allow read, delete: if isSiteAdmin();
+      allow update: if false;
+    }
+  }
+}

@@ -1,0 +1,5 @@
+-dontwarn javax.annotation.**
+-dontwarn org.checkerframework.**
+-dontwarn com.google.errorprone.annotations.**
+-dontwarn org.slf4j.**
+-keepattributes Signature,*Annotation*
