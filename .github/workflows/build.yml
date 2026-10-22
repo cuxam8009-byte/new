@@ -1,93 +1,27 @@
 name: Build APK
-
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
-
+    branches: [main, master]
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Set up Java
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-
-      - name: Debug repository files
+      - name: Copy google-services
         run: |
-          echo "=== Repository root ==="
-          pwd
-          ls -la
-          echo "=== Important files ==="
-          find . -maxdepth 4 -type f \( \
-            -name '*.zip' -o \
-            -name 'settings.gradle' -o \
-            -name 'settings.gradle.kts' -o \
-            -name 'google-services.json' \
-          \)
-
-      - name: Prepare source
-        run: |
-          set -eu
-
-          rm -rf src_build
-          mkdir -p src_build
-
-          if [ -f project.zip ]; then
-            echo "Extracting project.zip..."
-            unzip -q project.zip -d src_build
-
-          elif [ -f settings.gradle ] || [ -f settings.gradle.kts ]; then
-            echo "Copying Android project..."
-            find . -mindepth 1 -maxdepth 1 \
-              ! -name src_build \
-              ! -name .git \
-              -exec cp -a {} src_build/ \;
-
-          else
-            echo "ERROR: Cannot find project.zip or Gradle project."
-            exit 1
-          fi
-
-          if [ ! -f google-services.json ]; then
-            echo "ERROR: google-services.json is missing from repository root."
-            exit 1
-          fi
-
-          if [ ! -f src_build/settings.gradle ] && \
-             [ ! -f src_build/settings.gradle.kts ]; then
-            echo "ERROR: Gradle settings file not found in src_build."
-            echo "Check whether project.zip contains an extra parent directory."
-            find src_build -maxdepth 3 -type f
-            exit 1
-          fi
-
-          mkdir -p src_build/app
-          cp google-services.json src_build/app/google-services.json
-
-          echo "Source preparation completed."
-
-      - name: Build APK
-        working-directory: src_build
-        run: |
-          gradle assembleRelease --no-daemon --stacktrace
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+          test -f google-services.json
+          cp google-services.json app/google-services.json
+      - name: Build
+        run: gradle assembleRelease --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
         with:
           name: Nest-APK
-          path: src_build/app/build/outputs/apk/release/*.apk
-          if-no-files-found: error
+          path: app/build/outputs/apk/release/*.apk
